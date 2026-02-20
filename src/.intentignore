@@ -1,0 +1,73 @@
+# .intentignore
+# ─────────────────────────────────────────────────────────────
+# Files listed here are EXEMPT from ScopeEnforcer checks.
+# Any intent can write to these files without a scope violation.
+#
+# Supports ** glob patterns (same as .gitignore syntax).
+# Lines starting with # are comments.
+# ─────────────────────────────────────────────────────────────
+
+# Package & dependency manifests
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# TypeScript config
+tsconfig.json
+tsconfig.*.json
+
+# Linting / formatting
+.eslintrc*
+.eslintignore
+.prettierrc*
+.prettierignore
+biome.json
+
+# Git
+.gitignore
+.gitattributes
+
+# Editor config
+.editorconfig
+.vscode/settings.json
+.vscode/extensions.json
+
+# Environment examples (never .env itself — secrets)
+.env.example
+
+# Root README
+README.md
+
+# Orchestration files — managed directly by hooks, not agents
+.orchestration/agent_trace.jsonl
+.orchestration/intent_map.md
+
+# Shared agent brain — all agents and humans write here
+CLAUDE.md
+```
+
+---
+
+## Full Placement Summary
+```
+Roo-Codefroked/              ← repo root
+├── .intentignore            ← NEW (scope exemptions)
+├── .gitignore
+├── package.json
+├── CLAUDE.md                ← NEW (shared agent brain)
+├── .orchestration/          ← NEW
+│   ├── active_intents.yaml
+│   ├── agent_trace.jsonl
+│   └── intent_map.md
+└── src/
+    ├── extension.ts         ← MODIFIED (hook registration)
+    └── core/
+        ├── assistant-message/
+        │   └── presentAssistantMessage.ts   ← MODIFIED
+        └── hooks/           ← NEW
+            ├── index.ts
+            ├── HookEngine.ts
+            ├── pre/
+            ├── post/
+            └── utils/
