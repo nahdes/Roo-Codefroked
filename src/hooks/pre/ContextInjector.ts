@@ -5,7 +5,7 @@ PRE-HOOK #2 — The Context Injector
 ─────────────────────────────────────────────────────────────
 */
 import { ToolContext, BlockSignal } from "../HookEngine"
-import { findIntent, loadIntents, ActiveIntent } from "../utils/Intentstore"
+import { findIntent, loadIntents, ActiveIntent } from "../utils/intentStore"
 
 export async function contextInjector(ctx: ToolContext): Promise<ToolContext | BlockSignal> {
 	if (ctx.toolName !== "select_active_intent") return ctx
