@@ -1,165 +1,140 @@
 /**
-utils/mutationClassifier.ts
-─────────────────────────────────────────────────────────────
-Deterministic classification of code mutations.
-Two classes:
-AST_REFACTOR    – Same exported API surface, internal changes only.
-                (rename variable, extract helper, format code)
-INTENT_EVOLUTION – The exported API surface changed.
-                (new function, changed signature, deleted export)
-The hook computes this — the agent does NOT self-report it.
-This is what makes the system deterministic.
-─────────────────────────────────────────────────────────────
-*/
-import * as path from "path"
+ * utils/mutationClassifier.ts
+ * ─────────────────────────────────────────────────────────────
+ * Deterministic mutation classifier.
+ *
+ * Compares the exported API surface of old vs new file content
+ * and returns a machine-computed mutation class — NEVER relying
+ * on agent self-reporting.
+ *
+ * Rules:
+ *   Same exports (names + kinds + paramCounts) → AST_REFACTOR
+ *   Any added, removed, or changed export       → INTENT_EVOLUTION
+ *   Non-TS/JS file or parse failure             → UNKNOWN
+ * ─────────────────────────────────────────────────────────────
+ */
+
+import { extractExports, ExportSignature } from "./astHasher"
 
 export type MutationClass = "AST_REFACTOR" | "INTENT_EVOLUTION" | "UNKNOWN"
 
 export interface ClassificationResult {
 	mutationClass: MutationClass
 	reason: string
-	addedExports: string[]
-	removedExports: string[]
-	changedSignatures: string[]
+	added: string[]
+	removed: string[]
+	changed: string[]
 }
 
 /**
-Compare old and new file content and classify the mutation.
-Falls back to UNKNOWN for non-JS/TS files.
-*/
+ * Classify a mutation by comparing old and new file content.
+ *
+ * @param oldContent  File content BEFORE the write (from OptimisticLockGuard.__oldContent__)
+ * @param newContent  File content AFTER the write
+ * @param filePath    Absolute or workspace-relative path (used to detect file type)
+ */
 export async function classifyMutation(
 	oldContent: string,
 	newContent: string,
 	filePath: string,
 ): Promise<ClassificationResult> {
-	const ext = path.extname(filePath).toLowerCase()
-	const isTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"].includes(ext)
-
-	if (!isTS) {
-		return {
-			mutationClass: "UNKNOWN",
-			reason: "Non-JS/TS file — cannot perform AST analysis",
-			addedExports: [],
-			removedExports: [],
-			changedSignatures: [],
-		}
-	}
-
 	try {
-		const { parse } = await import("@typescript-eslint/typescript-estree")
-		const oldAST = parse(oldContent, {
-			loc: true,
-			tolerant: true,
-			jsx: ext.includes("x"),
-		})
-		const newAST = parse(newContent, {
-			loc: true,
-			tolerant: true,
-			jsx: ext.includes("x"),
-		})
+		const [oldExports, newExports] = await Promise.all([
+			extractExports(oldContent, filePath),
+			extractExports(newContent, filePath),
+		])
 
-		const oldExports = extractExportSignatures(oldAST)
-		const newExports = extractExportSignatures(newAST)
+		// If we got no exports from either (non-TS file or parse error) return UNKNOWN
+		if (oldExports.length === 0 && newExports.length === 0) {
+			return {
+				mutationClass: "UNKNOWN",
+				reason: "Could not parse exports — non-TypeScript file or parse error",
+				added: [],
+				removed: [],
+				changed: [],
+			}
+		}
 
-		const added = newExports.filter((s) => !oldExports.includes(s))
-		const removed = oldExports.filter((s) => !newExports.includes(s))
-		const changedSignatures = detectSignatureChanges(oldAST, newAST)
+		const oldMap = exportMap(oldExports)
+		const newMap = exportMap(newExports)
 
-		if (added.length === 0 && removed.length === 0 && changedSignatures.length === 0) {
+		const added: string[] = []
+		const removed: string[] = []
+		const changed: string[] = []
+
+		// Find added and changed exports
+		for (const [key, newSig] of newMap.entries()) {
+			if (!oldMap.has(key)) {
+				added.push(formatSig(newSig))
+			} else {
+				const oldSig = oldMap.get(key)!
+				if (sigChanged(oldSig, newSig)) {
+					changed.push(`${formatSig(oldSig)} → ${formatSig(newSig)}`)
+				}
+			}
+		}
+
+		// Find removed exports
+		for (const [key, oldSig] of oldMap.entries()) {
+			if (!newMap.has(key)) {
+				removed.push(formatSig(oldSig))
+			}
+		}
+
+		if (added.length === 0 && removed.length === 0 && changed.length === 0) {
 			return {
 				mutationClass: "AST_REFACTOR",
 				reason: "Exported API surface unchanged — internal refactor only",
-				addedExports: [],
-				removedExports: [],
-				changedSignatures: [],
+				added: [],
+				removed: [],
+				changed: [],
 			}
 		}
+
+		const parts: string[] = []
+		if (added.length > 0) parts.push(`+${added.length} added: ${added.join(", ")}`)
+		if (removed.length > 0) parts.push(`-${removed.length} removed: ${removed.join(", ")}`)
+		if (changed.length > 0) parts.push(`~${changed.length} changed: ${changed.join(", ")}`)
 
 		return {
 			mutationClass: "INTENT_EVOLUTION",
-			reason: `API surface changed: +${added.length} exports, -${removed.length} exports, ~${changedSignatures.length} signature changes`,
-			addedExports: added,
-			removedExports: removed,
-			changedSignatures,
+			reason: `API surface changed: ${parts.join("; ")}`,
+			added,
+			removed,
+			changed,
 		}
 	} catch (err) {
-		console.warn("[mutationClassifier] Parse error:", err)
 		return {
 			mutationClass: "UNKNOWN",
-			reason: `Parse error: ${(err as Error).message}`,
-			addedExports: [],
-			removedExports: [],
-			changedSignatures: [],
+			reason: `Classification error: ${err instanceof Error ? err.message : String(err)}`,
+			added: [],
+			removed: [],
+			changed: [],
 		}
 	}
 }
 
-// ── Internal helpers ───────────────────────────────────────────
-type ParsedAST = { body: any[] }
+// ── Helpers ────────────────────────────────────────────────────
 
-function extractExportSignatures(ast: ParsedAST): string[] {
-	const sigs: string[] = []
-	for (const node of ast.body) {
-		if (node.type === "ExportNamedDeclaration") {
-			const decl = node.declaration
-			if (!decl) {
-				for (const spec of node.specifiers ?? []) {
-					sigs.push(`reexport:${spec.exported?.name ?? spec.local?.name}`)
-				}
-				continue
-			}
-
-			if (decl.type === "FunctionDeclaration") {
-				sigs.push(`fn:${decl.id?.name}:${decl.params?.length ?? 0}`)
-			} else if (decl.type === "ClassDeclaration") {
-				sigs.push(`class:${decl.id?.name}`)
-			} else if (decl.type === "VariableDeclaration") {
-				for (const declarator of decl.declarations ?? []) {
-					const name = declarator.id?.name
-					if (name) {
-						const init = declarator.init
-						if (init?.type === "ArrowFunctionExpression" || init?.type === "FunctionExpression") {
-							sigs.push(`fn:${name}:${init.params?.length ?? 0}`)
-						} else {
-							sigs.push(`var:${name}`)
-						}
-					}
-				}
-			} else if (decl.type === "TSTypeAliasDeclaration") {
-				sigs.push(`type:${decl.id?.name}`)
-			} else if (decl.type === "TSInterfaceDeclaration") {
-				sigs.push(`interface:${decl.id?.name}`)
-			}
-		}
-
-		if (node.type === "ExportDefaultDeclaration") {
-			sigs.push("default:export")
-		}
-	}
-	return sigs
+function exportKey(sig: ExportSignature): string {
+	return `${sig.kind}:${sig.name}`
 }
 
-function detectSignatureChanges(oldAST: ParsedAST, newAST: ParsedAST): string[] {
-	const oldFns = extractFunctionMap(oldAST)
-	const newFns = extractFunctionMap(newAST)
-	const changes: string[] = []
-	for (const [name, paramCount] of Object.entries(oldFns)) {
-		if (name in newFns && newFns[name] !== paramCount) {
-			changes.push(`${name}: ${paramCount} → ${newFns[name]} params`)
-		}
-	}
-	return changes
-}
-
-function extractFunctionMap(ast: ParsedAST): Record<string, number> {
-	const map: Record<string, number> = {}
-	for (const node of ast.body) {
-		if (node.type === "ExportNamedDeclaration" && node.declaration) {
-			const decl = node.declaration
-			if (decl.type === "FunctionDeclaration" && decl.id?.name) {
-				map[decl.id.name] = decl.params?.length ?? 0
-			}
-		}
+function exportMap(exports: ExportSignature[]): Map<string, ExportSignature> {
+	const map = new Map<string, ExportSignature>()
+	for (const sig of exports) {
+		map.set(exportKey(sig), sig)
 	}
 	return map
+}
+
+function sigChanged(old: ExportSignature, next: ExportSignature): boolean {
+	if (old.kind !== next.kind) return true
+	if (old.kind === "fn" && old.paramCount !== next.paramCount) return true
+	return false
+}
+
+function formatSig(sig: ExportSignature): string {
+	if (sig.kind === "fn") return `fn:${sig.name}:${sig.paramCount ?? 0}`
+	return `${sig.kind}:${sig.name}`
 }
