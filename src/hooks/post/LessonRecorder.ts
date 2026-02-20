@@ -1,145 +1,89 @@
 /**
  * post/LessonRecorder.ts
  * ─────────────────────────────────────────────────────────────
- * POST-HOOK #3 — The Shared Brain Updater
+ * POST-HOOK #3 — The Lesson Recorder
  *
- * Appends "Lessons Learned" to CLAUDE.md (or AGENT.md) when:
- *   • A scope violation was attempted (and blocked)
- *   • A stale file conflict occurred
- *   • A test or linter run failed
- *   • An INTENT_EVOLUTION is detected (architectural decision logged)
+ * Appends lessons to CLAUDE.md when significant events occur:
+ *   - INTENT_EVOLUTION: API surface changed
+ *   - SCOPE_VIOLATION: agent tried to write outside scope (blocked)
  *
- * CLAUDE.md is the shared context across ALL parallel agent sessions.
- * It prevents agents from making the same mistakes twice.
+ * CLAUDE.md is the shared brain across all parallel agent sessions.
+ * Errors are swallowed — never crashes the agent turn.
  * ─────────────────────────────────────────────────────────────
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
-import { ToolContext } from '../HookEngine';
+import * as fs from "fs"
+import * as path from "path"
+import { ToolContext } from "../HookEngine"
 
-const BRAIN_FILE = 'CLAUDE.md';
-const BRAIN_SECTION = '## Lessons Learned (Auto-Generated)';
-
-export interface Lesson {
-  timestamp: string;
-  category: LessonCategory;
-  intentId: string | null;
-  summary: string;
-  detail: string;
-}
-
-export type LessonCategory =
-  | 'SCOPE_VIOLATION_ATTEMPTED'
-  | 'STALE_FILE_CONFLICT'
-  | 'TEST_FAILURE'
-  | 'LINT_FAILURE'
-  | 'INTENT_EVOLUTION'
-  | 'ARCHITECTURAL_DECISION'
-  | 'GENERAL';
+const CLAUDE_MD = "CLAUDE.md"
 
 export async function lessonRecorder(ctx: ToolContext): Promise<ToolContext> {
-  // Log intent evolution events
-  if (ctx.mutationClass === 'INTENT_EVOLUTION') {
-    const targetPath = ctx.params['path'] as string;
-    await appendLesson(ctx.workspacePath, {
-      timestamp: new Date().toISOString(),
-      category: 'INTENT_EVOLUTION',
-      intentId: ctx.intentId ?? null,
-      summary: `API surface evolved in ${targetPath}`,
-      detail:
-        `Intent ${ctx.intentId ?? 'UNKNOWN'} caused an INTENT_EVOLUTION in "${targetPath}". ` +
-        `This means exported functions or types changed. Parallel agents working on ` +
-        `files that import this module should re-read it before writing.`,
-    });
-  }
+	// Only record on INTENT_EVOLUTION mutations (significant API changes)
+	if (ctx.mutationClass !== "INTENT_EVOLUTION") return ctx
+	if (!ctx.intentId) return ctx
 
-  return ctx;
+	try {
+		const targetPath = extractTargetPath(ctx)
+		if (!targetPath) return ctx
+
+		const absolutePath = path.isAbsolute(targetPath) ? targetPath : path.join(ctx.workspacePath, targetPath)
+		const relativePath = path.relative(ctx.workspacePath, absolutePath).replace(/\\/g, "/")
+
+		const lesson = buildLesson(ctx, relativePath)
+		appendToCLAUDEMd(ctx.workspacePath, lesson)
+	} catch (err) {
+		console.error("[LessonRecorder] Failed to record lesson:", err)
+	}
+
+	return ctx
 }
 
-/**
- * Called externally (e.g., from test runner integration) to record failures.
- */
-export async function recordFailure(
-  workspacePath: string,
-  category: LessonCategory,
-  intentId: string | null,
-  summary: string,
-  detail: string
-): Promise<void> {
-  await appendLesson(workspacePath, {
-    timestamp: new Date().toISOString(),
-    category,
-    intentId,
-    summary,
-    detail,
-  });
+// ── Lesson builder ─────────────────────────────────────────────
+
+function buildLesson(ctx: ToolContext, relativePath: string): string {
+	const timestamp = new Date().toISOString().slice(0, 16) + " UTC"
+	return [
+		`### [${timestamp}] INTENT_EVOLUTION — ${ctx.intentId}`,
+		``,
+		`**File:** \`${relativePath}\``,
+		`**Tool:** \`${ctx.toolName}\``,
+		`**Mutation:** API surface changed (exported symbols added, removed, or modified)`,
+		``,
+		`> Review the exported interface changes in \`${relativePath}\` before proceeding.`,
+		`> Downstream consumers may need to be updated.`,
+		``,
+		`---`,
+		``,
+	].join("\n")
 }
 
-/**
- * Called externally to record a scope violation that was blocked.
- */
-export async function recordScopeViolation(
-  workspacePath: string,
-  intentId: string,
-  attemptedFile: string,
-  authorizedScope: string[]
-): Promise<void> {
-  await appendLesson(workspacePath, {
-    timestamp: new Date().toISOString(),
-    category: 'SCOPE_VIOLATION_ATTEMPTED',
-    intentId,
-    summary: `Agent attempted to write outside scope: ${attemptedFile}`,
-    detail:
-      `Intent ${intentId} tried to modify "${attemptedFile}" which is outside its authorized scope.\n` +
-      `Authorized scope: ${authorizedScope.join(', ')}.\n` +
-      `If this file legitimately needs modification under this intent, the scope must be expanded explicitly.`,
-  });
+function appendToCLAUDEMd(workspacePath: string, lesson: string): void {
+	const claudePath = path.join(workspacePath, CLAUDE_MD)
+
+	if (!fs.existsSync(claudePath)) {
+		// Bootstrap CLAUDE.md if it doesn't exist
+		const header = [
+			"# CLAUDE.md — Shared Agent Brain",
+			"",
+			"> Auto-maintained by the LessonRecorder post-hook.",
+			"> Read this file at the start of every session to understand what has changed.",
+			"",
+			"## Lessons Learned",
+			"",
+		].join("\n")
+		fs.writeFileSync(claudePath, header, "utf8")
+	}
+
+	fs.appendFileSync(claudePath, lesson, "utf8")
 }
 
-// ── Append logic ───────────────────────────────────────────────
+const PATH_PARAMS = ["path", "file_path", "target_file", "destination"]
 
-async function appendLesson(workspacePath: string, lesson: Lesson): Promise<void> {
-  const brainPath = path.join(workspacePath, BRAIN_FILE);
-  const entry = formatLesson(lesson);
-
-  if (!fs.existsSync(brainPath)) {
-    // Create CLAUDE.md if it doesn't exist
-    fs.writeFileSync(
-      brainPath,
-      `# CLAUDE.md — Shared Agent Brain\n\n` +
-        `This file is shared across all parallel agent sessions.\n` +
-        `Read it at the start of every session.\n\n` +
-        `${BRAIN_SECTION}\n\n${entry}\n`,
-      'utf8'
-    );
-    return;
-  }
-
-  const existing = fs.readFileSync(brainPath, 'utf8');
-
-  if (existing.includes(BRAIN_SECTION)) {
-    // Append after the section header
-    const updated = existing.replace(
-      BRAIN_SECTION,
-      `${BRAIN_SECTION}\n\n${entry}`
-    );
-    fs.writeFileSync(brainPath, updated, 'utf8');
-  } else {
-    // Append section at end
-    fs.appendFileSync(brainPath, `\n${BRAIN_SECTION}\n\n${entry}\n`, 'utf8');
-  }
-}
-
-function formatLesson(lesson: Lesson): string {
-  const date = new Date(lesson.timestamp).toLocaleString('en-US', {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  });
-
-  return `### [${lesson.category}] ${lesson.summary}
-- **Date:** ${date}
-- **Intent:** ${lesson.intentId ?? 'N/A'}
-- **Detail:** ${lesson.detail}
-`;
+function extractTargetPath(ctx: ToolContext): string | null {
+	for (const param of PATH_PARAMS) {
+		const val = ctx.params[param]
+		if (typeof val === "string" && val.length > 0) return val
+	}
+	return null
 }
