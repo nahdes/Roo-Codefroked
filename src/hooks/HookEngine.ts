@@ -51,7 +51,14 @@ export class BlockSignal {
 	) {}
 }
 
-export type BlockCode = "NO_INTENT_DECLARED" | "SCOPE_VIOLATION" | "STALE_FILE" | "UNKNOWN_INTENT" | "GENERIC_BLOCK"
+export type BlockCode =
+	| "NO_INTENT_DECLARED"
+	| "SCOPE_VIOLATION"
+	| "STALE_FILE"
+	| "UNKNOWN_INTENT"
+	| "COMPLETE_INTENT"
+	| "BLOCKED_INTENT"
+	| "GENERIC_BLOCK"
 
 export type HookFn = (ctx: ToolContext) => Promise<ToolContext | BlockSignal>
 
