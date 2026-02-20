@@ -6,6 +6,10 @@ import { ConsecutiveMistakeError, TelemetryEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import { customToolRegistry } from "@roo-code/core"
 
+// ── Intent-Driven Hook System ────────────────────────────────────────────────
+import * as vscode from "vscode"
+import { runPreHooksForDispatch, runPostHooksForCtx } from "../../hooks"
+
 import { t } from "../../i18n"
 
 import { defaultModeSlug, getModeBySlug } from "../../shared/modes"
@@ -675,6 +679,39 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 			}
 
+			// ── Intent-Driven Hook System — PRE-HOOKS ───────────────────────────────
+			// Runs before every complete (non-partial) tool call.
+			// Hooks may block the tool, short-circuit with injected content,
+			// or enrich the ToolContext for post-hooks.
+			if (!block.partial) {
+				const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ""
+
+				const hookDispatch = await runPreHooksForDispatch(
+					block.name,
+					(block.nativeArgs ?? block.params ?? {}) as Record<string, unknown>,
+					workspacePath,
+					(cline as any).__currentIntentId as string | undefined,
+				)
+
+				if (hookDispatch.blocked) {
+					// Persist the active intent ID on the Task for subsequent tool calls this session
+					if (hookDispatch.ctx.intentId) {
+						;(cline as any).__currentIntentId = hookDispatch.ctx.intentId
+					}
+
+					// Return intercepted content (XML context block or block reason) to the LLM
+					pushToolResult(hookDispatch.interceptedContent ?? "(hook blocked tool execution)")
+
+					// Stash enriched ctx so post-hooks can still run (e.g. for logging blocked attempts)
+					;(cline as any).__lastHookCtx = hookDispatch.ctx
+					break
+				}
+
+				// Tool is proceeding — stash enriched ctx for post-hooks
+				;(cline as any).__lastHookCtx = hookDispatch.ctx
+			}
+			// ── End Pre-Hooks ────────────────────────────────────────────────────────
+
 			switch (block.name) {
 				case "write_to_file":
 					await checkpointSaveAndMark(cline)
@@ -916,6 +953,17 @@ export async function presentAssistantMessage(cline: Task) {
 					break
 				}
 			}
+
+			// ── Intent-Driven Hook System — POST-HOOKS ──────────────────────────────
+			// Fire-and-forget after every complete tool execution.
+			// Post-hooks write the audit trail, update intent_map.md, record lessons.
+			// Errors are swallowed inside runPostHooksForCtx — never crashes the turn.
+			if (!block.partial && (cline as any).__lastHookCtx) {
+				runPostHooksForCtx((cline as any).__lastHookCtx).catch((err: unknown) => {
+					console.error("[HookEngine] post-hook pipeline error (swallowed):", err)
+				})
+			}
+			// ── End Post-Hooks ───────────────────────────────────────────────────────
 
 			break
 		}

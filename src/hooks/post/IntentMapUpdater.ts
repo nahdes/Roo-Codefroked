@@ -1,115 +1,181 @@
 /**
  * post/IntentMapUpdater.ts
  * ─────────────────────────────────────────────────────────────
- * POST-HOOK #2 — The Spatial Map Updater
+ * POST-HOOK #2 — The Intent Map Updater
  *
- * Maintains .orchestration/intent_map.md — a human-readable
- * map that answers: "Where is the [feature] logic?"
+ * After every tracked file write, updates the spatial index in
+ * .orchestration/intent_map.md linking intent IDs to files.
  *
- * Updated whenever an INTENT_EVOLUTION is detected (new feature
- * or API surface change). Refactors do not update the map
- * because the intent-to-file mapping hasn't changed.
- *
- * Format: Markdown table with Intent → Files → Last Updated
+ * Errors are swallowed — never crashes the agent turn.
  * ─────────────────────────────────────────────────────────────
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
-import { ToolContext } from '../HookEngine';
-import { findIntent } from '../utils/intentStore';
-import { toRelativePath } from '../utils/gitUtils';
+import * as fs from "fs"
+import * as path from "path"
+import { ToolContext } from "../HookEngine"
+import { loadIntents } from "../utils/intentStore"
+import { toRelativePath } from "../utils/gitUtils"
 
-const MAP_FILE = path.join('.orchestration', 'intent_map.md');
+const MAP_FILE = ".orchestration/intent_map.md"
+const PATH_PARAMS = ["path", "file_path", "target_file", "destination"]
 
-interface IntentMapEntry {
-  intentId: string;
-  intentName: string;
-  files: string[];
-  lastUpdated: string;
-  mutationCount: number;
-}
+const WRITE_TOOLS = new Set([
+	"write_file",
+	"write_to_file",
+	"create_file",
+	"apply_diff",
+	"apply_patch",
+	"edit",
+	"search_and_replace",
+	"search_replace",
+	"edit_file",
+	"insert_code_block",
+	"replace_in_file",
+])
 
 export async function intentMapUpdater(ctx: ToolContext): Promise<ToolContext> {
-  // Only update map on file writes
-  const WRITE_TOOLS = new Set(['write_file', 'write_to_file', 'create_file', 'apply_diff', 'replace_in_file']);
-  if (!WRITE_TOOLS.has(ctx.toolName)) return ctx;
-  if (!ctx.intentId) return ctx;
+	if (!WRITE_TOOLS.has(ctx.toolName) || !ctx.intentId) return ctx
 
-  const targetPath = ctx.params['path'] as string ?? ctx.params['file_path'] as string;
-  if (!targetPath) return ctx;
+	const targetPath = extractTargetPath(ctx)
+	if (!targetPath) return ctx
 
-  const relativePath = toRelativePath(ctx.workspacePath, path.resolve(ctx.workspacePath, targetPath));
-  const intent = findIntent(ctx.workspacePath, ctx.intentId);
-  const intentName = intent?.name ?? ctx.intentId;
+	try {
+		const absolutePath = path.isAbsolute(targetPath) ? targetPath : path.join(ctx.workspacePath, targetPath)
+		const relativePath = toRelativePath(ctx.workspacePath, absolutePath)
 
-  const mapPath = path.join(ctx.workspacePath, MAP_FILE);
-  const existingMap = loadMap(mapPath);
+		// Load existing map data from the <!--DATA:...--> comment in the markdown
+		const mapPath = path.join(ctx.workspacePath, MAP_FILE)
+		const existingData = loadMapData(mapPath)
 
-  // Get or create entry for this intent
-  let entry = existingMap.find(e => e.intentId === ctx.intentId);
-  if (!entry) {
-    entry = {
-      intentId: ctx.intentId,
-      intentName,
-      files: [],
-      lastUpdated: new Date().toISOString(),
-      mutationCount: 0,
-    };
-    existingMap.push(entry);
-  }
+		// Update the entry for this intent
+		const entry = existingData.find((e) => e.intentId === ctx.intentId)
+		if (entry) {
+			if (!entry.files.includes(relativePath)) {
+				entry.files.push(relativePath)
+			}
+			entry.mutationCount = (entry.mutationCount ?? 0) + 1
+			entry.lastUpdated = new Date().toISOString()
+		} else {
+			existingData.push({
+				intentId: ctx.intentId,
+				intentName: ctx.intentId, // will be enriched below
+				status: "IN_PROGRESS",
+				files: [relativePath],
+				lastUpdated: new Date().toISOString(),
+				mutationCount: 1,
+			})
+		}
 
-  // Add file if not already tracked
-  if (!entry.files.includes(relativePath)) {
-    entry.files.push(relativePath);
-  }
+		// Enrich intent names from active_intents.yaml
+		const intents = loadIntents(ctx.workspacePath)
+		for (const d of existingData) {
+			const intent = intents.find((i) => i.id === d.intentId)
+			if (intent) {
+				d.intentName = intent.name
+				d.status = intent.status
+			}
+		}
 
-  entry.lastUpdated = new Date().toISOString();
-  entry.mutationCount += 1;
+		// Write the updated map
+		const markdown = buildMapMarkdown(existingData)
+		ensureDir(path.dirname(mapPath))
+		fs.writeFileSync(mapPath, markdown, "utf8")
+	} catch (err) {
+		console.error("[IntentMapUpdater] Failed to update intent_map.md:", err)
+	}
 
-  // Write the updated map
-  fs.mkdirSync(path.dirname(mapPath), { recursive: true });
-  fs.writeFileSync(mapPath, renderMap(existingMap), 'utf8');
-
-  return ctx;
+	return ctx
 }
 
-// ── Map serialization ──────────────────────────────────────────
+// ── Data model ─────────────────────────────────────────────────
 
-function loadMap(mapPath: string): IntentMapEntry[] {
-  if (!fs.existsSync(mapPath)) return [];
-
-  try {
-    const content = fs.readFileSync(mapPath, 'utf8');
-    // Parse the HTML comment data block we embed in the file
-    const match = content.match(/<!--DATA:([\s\S]+?)-->/);
-    if (match) {
-      return JSON.parse(match[1]);
-    }
-  } catch {
-    // If parse fails, start fresh
-  }
-  return [];
+interface MapEntry {
+	intentId: string
+	intentName: string
+	status: string
+	files: string[]
+	lastUpdated: string
+	mutationCount: number
 }
 
-function renderMap(entries: IntentMapEntry[]): string {
-  const rows = entries
-    .sort((a, b) => a.intentId.localeCompare(b.intentId))
-    .map(e => {
-      const fileLinks = e.files.map(f => `\`${f}\``).join(', ');
-      const date = new Date(e.lastUpdated).toLocaleString('en-US', { dateStyle: 'short', timeStyle: 'short' });
-      return `| ${e.intentId} | ${e.intentName} | ${fileLinks} | ${e.mutationCount} | ${date} |`;
-    })
-    .join('\n');
+function loadMapData(mapPath: string): MapEntry[] {
+	if (!fs.existsSync(mapPath)) return []
+	try {
+		const content = fs.readFileSync(mapPath, "utf8")
+		const match = content.match(/<!--DATA:([\s\S]+?)-->/)
+		if (!match) return []
+		return JSON.parse(match[1]) as MapEntry[]
+	} catch {
+		return []
+	}
+}
 
-  return `# Intent Map
-> Auto-generated by the Hook System. Do not edit manually.
-> Last regenerated: ${new Date().toISOString()}
+function buildMapMarkdown(data: MapEntry[]): string {
+	const now = new Date().toISOString()
 
-| Intent ID | Intent Name | Files | Mutations | Last Updated |
-|-----------|-------------|-------|-----------|--------------|
-${rows}
+	const rows = data
+		.map((d) => {
+			const status = statusEmoji(d.status) + " `" + d.status + "`"
+			return `| ${d.intentId} | ${d.intentName} | ${status} | ${d.files.length} | ${d.mutationCount} | ${d.lastUpdated.slice(0, 16)} UTC |`
+		})
+		.join("\n")
 
-<!--DATA:${JSON.stringify(entries)}-->
-`;
+	const sections = data
+		.map((d) => {
+			const fileRows = d.files.map((f) => `| \`${f}\` | — | — |`).join("\n")
+			return `## ${d.intentId} — ${d.intentName}
+
+**Status:** ${statusEmoji(d.status)} \`${d.status}\`
+**Mutations:** ${d.mutationCount} | **Last updated:** ${d.lastUpdated.slice(0, 16)} UTC
+
+### Files Modified
+
+| File | Last Hash | Last Class |
+|------|-----------|------------|
+${fileRows || "| — | — | — |"}
+`
+		})
+		.join("\n---\n\n")
+
+	return `# Intent Map
+> **Auto-generated by the IntentMapUpdater post-hook. Do not edit manually.**
+> Last updated: \`${now}\`
+> Total intents: ${data.length} | Total mutations: ${data.reduce((s, d) => s + d.mutationCount, 0)}
+
+---
+
+## Summary
+
+| Intent ID | Intent Name | Status | Files | Mutations | Last Active |
+|-----------|-------------|--------|-------|-----------|-------------|
+${rows || "| — | — | — | — | — | — |"}
+
+---
+
+${sections}
+
+<!--DATA:${JSON.stringify(data)}-->
+`
+}
+
+function statusEmoji(status: string): string {
+	const map: Record<string, string> = {
+		IN_PROGRESS: "🟡",
+		PENDING: "⚪",
+		COMPLETE: "✅",
+		BLOCKED: "🔴",
+	}
+	return map[status] ?? "⚫"
+}
+
+function extractTargetPath(ctx: ToolContext): string | null {
+	for (const param of PATH_PARAMS) {
+		const val = ctx.params[param]
+		if (typeof val === "string" && val.length > 0) return val
+	}
+	return null
+}
+
+function ensureDir(dirPath: string): void {
+	if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true })
 }

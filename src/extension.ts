@@ -194,6 +194,26 @@ export async function activate(context: vscode.ExtensionContext) {
 	// Initialize the provider *before* the Roo Code Cloud service.
 	const provider = new ClineProvider(context, outputChannel, "sidebar", contextProxy, mdmService)
 
+	// ── Intent-Driven Hook System ───────────────────────────────────────────
+	// Register all pre/post hooks for intent-code traceability.
+	// Must run AFTER ClineProvider is created (workspaceFolders are now available).
+	try {
+		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ""
+		if (workspacePath) {
+			const { registerAllHooks } = await import("./hooks")
+			registerAllHooks(workspacePath)
+			outputChannel.appendLine(`[HookEngine] Intent-driven hook system registered for: ${workspacePath}`)
+		} else {
+			outputChannel.appendLine("[HookEngine] No workspace folder found — hook system not registered.")
+		}
+	} catch (hookError) {
+		// Never fail extension activation due to hook registration errors
+		outputChannel.appendLine(
+			`[HookEngine] Failed to register hooks: ${hookError instanceof Error ? hookError.message : String(hookError)}`,
+		)
+	}
+	// ── End Hook System ─────────────────────────────────────────────────────
+
 	// Initialize Roo Code Cloud service.
 	const postStateListener = () => ClineProvider.getVisibleInstance()?.postStateToWebviewWithoutClineMessages()
 
