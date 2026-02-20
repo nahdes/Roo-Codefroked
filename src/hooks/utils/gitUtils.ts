@@ -1,64 +1,58 @@
 /**
-utils/gitUtils.ts
-─────────────────────────────────────────────────────────────
-Lightweight git helpers for the hook system.
-─────────────────────────────────────────────────────────────
-*/
-import { execSync } from "child_process";
-import * as path from "path";
+ * utils/gitUtils.ts
+ * ─────────────────────────────────────────────────────────────
+ * Non-throwing git helpers for the Hook System.
+ * All functions return null rather than throwing on failure.
+ * ─────────────────────────────────────────────────────────────
+ */
 
+import { execSync } from "child_process"
+import * as path from "path"
+
+/**
+ * Get the current HEAD git SHA in the given workspace.
+ * Returns null if git is not available or the directory is not a repo.
+ */
 export function getCurrentGitSha(workspacePath: string): string | null {
-  try {
-    return execSync("git rev-parse HEAD", {
-      cwd: workspacePath,
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 3000,
-    })
-      .toString()
-      .trim();
-  } catch {
-    return null;
-  }
+	try {
+		return execSync("git rev-parse HEAD", {
+			cwd: workspacePath,
+			encoding: "utf8",
+			stdio: ["pipe", "pipe", "pipe"],
+			timeout: 3000,
+		}).trim()
+	} catch {
+		return null
+	}
 }
 
-export function getFileGitSha(
-  workspacePath: string,
-  relativeFilePath: string
-): string | null {
-  try {
-    return execSync(`git hash-object "${relativeFilePath}"`, {
-      cwd: workspacePath,
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 3000,
-    })
-      .toString()
-      .trim();
-  } catch {
-    return null;
-  }
+/**
+ * Convert an absolute file path to a workspace-relative posix path.
+ * Returns the original path if it cannot be made relative.
+ */
+export function toRelativePath(workspacePath: string, absolutePath: string): string {
+	try {
+		return path.relative(workspacePath, absolutePath).replace(/\\/g, "/")
+	} catch {
+		return absolutePath
+	}
 }
 
-export function hasUncommittedChanges(
-  workspacePath: string,
-  relativeFilePath: string
-): boolean {
-  try {
-    const result = execSync(`git status --porcelain "${relativeFilePath}"`, {
-      cwd: workspacePath,
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 3000,
-    })
-      .toString()
-      .trim();
-    return result.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-export function toRelativePath(
-  workspacePath: string,
-  absoluteFilePath: string
-): string {
-  return path.relative(workspacePath, absoluteFilePath).replace(/\\/g, "/"); // ✅ FIXED
+/**
+ * Get the git-tracked SHA of a specific file at HEAD.
+ * Returns null if the file is untracked or git is unavailable.
+ */
+export function getFileShaAtHead(workspacePath: string, relativePath: string): string | null {
+	try {
+		return (
+			execSync(`git ls-files --format='%(objectname)' -- "${relativePath}"`, {
+				cwd: workspacePath,
+				encoding: "utf8",
+				stdio: ["pipe", "pipe", "pipe"],
+				timeout: 3000,
+			}).trim() || null
+		)
+	} catch {
+		return null
+	}
 }
